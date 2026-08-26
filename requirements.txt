@@ -5,6 +5,8 @@ duckdb>=0.10.0
 pandas>=2.0.0
 rapidfuzz>=3.0.0
 requests>=2.31.0
+gspread>=6.0.0
+google-auth>=2.28.0
 
 # Build-time only: downloads the IPEDS database during docker build
 scipeds>=0.0.8

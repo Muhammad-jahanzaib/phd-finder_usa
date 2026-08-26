@@ -7,17 +7,20 @@ NSF-funded research awards. Deployable to Streamlit Community Cloud
 or any Docker-capable host.
 """
 
-import csv
 import io
+import json
 import os
 import re
+import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import duckdb
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
 from rapidfuzz import fuzz, process
 
 from config import (
@@ -26,30 +29,65 @@ from config import (
 )
 
 GA4_ID = "G-V1BCYS79RM"
-USAGE_LOG = DATA_DIR / "usage_log.csv"
-USAGE_LOG_FIELDS = ["timestamp", "tab", "query", "num_results"]
+SHEET_NAME = "PhD Finder Usage Log"
+_SHEETS_LOG = DATA_DIR / "sheets_debug.log"
+
+
+def _sheets_log(msg: str):
+    """Append a timestamped line to data/sheets_debug.log (visible via docker exec)."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_SHEETS_LOG, "a") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
 
 
 # ── Database helpers ──────────────────────────────────────────────────────
 
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+@st.cache_resource
+def _get_gspread_client():
+    """Return a cached gspread client, or None if credentials are missing/invalid."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    if not creds_json:
+        return None
+    try:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        return gspread.authorize(creds)
+    except Exception as e:
+        _sheets_log(f"FAILED _get_gspread_client: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None
+
+
 def _log_search(tab: str, query: str, num_results: int):
-    """Append an anonymous search record to usage_log.csv.
+    """Append an anonymous search record to the Google Sheet.
 
     Logs only: timestamp, which tab, the query text, and result count.
     No IP addresses, session IDs, or user agents are recorded.
+    Fails silently — never breaks or slows down search results.
     """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    file_exists = USAGE_LOG.exists()
-    with open(USAGE_LOG, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=USAGE_LOG_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "tab": tab,
-            "query": query,
-            "num_results": num_results,
-        })
+    try:
+        client = _get_gspread_client()
+        if client is None:
+            _sheets_log(f"_log_search skipped — no client (tab={tab}, query={query!r})")
+            return
+        sheet = client.open(SHEET_NAME).sheet1
+        sheet.append_row(
+            [datetime.now().isoformat(timespec="seconds"), tab, query, num_results],
+            value_input_option="RAW",
+        )
+        _sheets_log(f"_log_search OK — tab={tab}, query={query!r}, results={num_results}")
+    except Exception as e:
+        _sheets_log(f"_log_search FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
 
 @st.cache_resource
 def get_db():
@@ -215,25 +253,11 @@ def _render_footer():
     st.markdown("---")
     st.markdown(
         f"""
-**About PhD Finder**
-This is an independent, open-source tool for exploring U.S. doctoral programs and
-funded research. It is **not affiliated with** the National Science Foundation, the
-National Center for Education Statistics, or any government agency.
+**About** · Independent, open-source tool. Not affiliated with NSF, NCES, or any government agency.
 
-**Data Sources**
-- **Doctoral completions**: U.S. Department of Education, IPEDS Completions Survey
-  (via the [scipeds](https://github.com/daniel-s-ford/scipeds) package)
-- **Funded research**: NSF Award Search API
-  (`research.gov/awardapi-service`)
+**Data** · Doctoral completions: U.S. Dept. of Education, IPEDS (via [scipeds](https://github.com/daniel-s-ford/scipeds)). Funded research: [NSF Award Search API](https://www.research.gov/awardapi-service).
 
-**Known Limitations**
-- IPEDS reports *completed* degrees, not currently open admissions programs.
-  A program with zero recent graduates may still be active and admitting students.
-- The NSF funding search only covers NSF-funded awards. Research funded by NIH,
-  DARPA, DOE, industry, or foreign sources will not appear.
-- A PI having an active award does not guarantee they are accepting new PhD students.
-- Abstract keyword matching can produce false positives — read the abstract snippet
-  before treating a match as confirmed-relevant.
+**Limitations** · IPEDS shows completed degrees, not open programs. NSF search covers only NSF-funded awards. Active grants don't guarantee student openings. Keyword matches can be false positives — check the abstract.
 
 **Last refreshed**: {last_refreshed}
 """
@@ -243,18 +267,39 @@ National Center for Education Statistics, or any government agency.
 
 
 def _render_admin_view():
-    """Read-only admin dashboard showing usage stats from usage_log.csv."""
+    """Read-only admin dashboard showing usage stats from the Google Sheet."""
     st.markdown("---")
     st.header("📊 Admin — Usage Insights")
 
-    if not USAGE_LOG.exists():
+    try:
+        client = _get_gspread_client()
+        if client is None:
+            st.warning("Google Sheets credentials not configured. Set "
+                       "`GOOGLE_SHEETS_CREDENTIALS_JSON` env var to enable usage logging.")
+            _sheets_log("_render_admin_view: no client — credentials missing or invalid")
+            return
+        sheet = client.open(SHEET_NAME).sheet1
+        rows = sheet.get_all_values()
+        _sheets_log(f"_render_admin_view: read {len(rows)} rows from sheet")
+    except Exception as e:
+        st.warning(f"Could not read usage data from Google Sheets: {e}")
+        _sheets_log(f"_render_admin_view FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return
+
+    if len(rows) <= 1:
         st.info("No usage data logged yet.")
         return
 
-    df = pd.read_csv(USAGE_LOG)
-    if df.empty:
-        st.info("Usage log is empty.")
-        return
+    header = rows[0]
+    data = rows[1:]
+    df = pd.DataFrame(data, columns=header)
+
+    # Coerce num_results to int
+    if "results_count" in df.columns:
+        df["num_results"] = pd.to_numeric(df["results_count"], errors="coerce").fillna(0).astype(int)
+    elif "num_results" in df.columns:
+        df["num_results"] = pd.to_numeric(df["num_results"], errors="coerce").fillna(0).astype(int)
 
     st.metric("Total searches logged", len(df))
 
@@ -278,12 +323,13 @@ def _render_admin_view():
         st.dataframe(inst_counts.reset_index().rename(columns={"query": "institution", "count": "searches"}))
 
     # Dead-end searches (0 results)
-    zero_df = df[df["num_results"] == 0]
-    if not zero_df.empty:
-        st.subheader(f"Searches with 0 results ({len(zero_df)} total)")
-        zero_counts = zero_df.groupby(["tab", "query"]).size().reset_index(name="times")
-        zero_counts = zero_counts.sort_values("times", ascending=False).head(30)
-        st.dataframe(zero_counts)
+    if "num_results" in df.columns:
+        zero_df = df[df["num_results"] == 0]
+        if not zero_df.empty:
+            st.subheader(f"Searches with 0 results ({len(zero_df)} total)")
+            zero_counts = zero_df.groupby(["tab", "query"]).size().reset_index(name="times")
+            zero_counts = zero_counts.sort_values("times", ascending=False).head(30)
+            st.dataframe(zero_counts)
 
     # Day-by-day volume
     st.subheader("Search volume by day")
@@ -300,6 +346,20 @@ def main():
         page_icon="🎓",
         layout="wide",
     )
+
+    # ── Startup diagnostics (Google Sheets) ───────────────────────────────
+    creds_raw = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    if "sheets_startup_done" not in st.session_state:
+        st.session_state["sheets_startup_done"] = True
+        if not creds_raw:
+            _sheets_log("STARTUP: GOOGLE_SHEETS_CREDENTIALS_JSON NOT SET — logging disabled")
+        else:
+            try:
+                json.loads(creds_raw)
+                _sheets_log(f"STARTUP: GOOGLE_SHEETS_CREDENTIALS_JSON present, valid JSON "
+                            f"(length={len(creds_raw)})")
+            except json.JSONDecodeError as e:
+                _sheets_log(f"STARTUP: GOOGLE_SHEETS_CREDENTIALS_JSON present but INVALID JSON — {e}")
 
     # ── Google Analytics (GA4) ────────────────────────────────────────────
     st.markdown(
@@ -318,13 +378,20 @@ def main():
     # ── Landing paragraph ─────────────────────────────────────────────────
     st.title("🎓 PhD Finder")
     st.markdown(
-        "Search **U.S. doctoral programs** by field or institution, and explore "
-        "**NSF-funded research awards** to find active professors and labs. "
-        "Data comes from the U.S. Department of Education (IPEDS) and the "
-        "National Science Foundation — two authoritative public sources. "
-        "Enter a field like *chemistry*, *mechanical engineering*, or *sociology* "
-        "to see which universities grant doctoral degrees in that area, or search "
-        "by institution name to see all doctoral fields a school offers."
+        "Search U.S. doctoral programs by field or institution, or find professors "
+        "with active NSF research grants. "
+        "Data from the U.S. Department of Education (IPEDS) and the "
+        "National Science Foundation."
+    )
+
+    st.markdown(
+        "**How to use**\n"
+        "- **Field search** — type a field name (e.g. \"computer science\", \"chemistry\") "
+        "to see which universities offer a PhD in that area.\n"
+        "- **Institution search** — type a university name to see every doctoral field it offers.\n"
+        "- **NSF funded research** — search for active government-funded research grants "
+        "in a specific area.\n\n"
+        "No sign-up needed — just type and search."
     )
 
     # ── Load data ─────────────────────────────────────────────────────────
@@ -363,18 +430,18 @@ def main():
 
     # ── Tabs ──────────────────────────────────────────────────────────────
     tab_field, tab_institution, tab_funded = st.tabs([
-        "🔍 Search by Field",
-        "🏛️ Search by Institution",
-        "💰 Funded Research Search",
+        "🔍 By Field",
+        "🏛️ By Institution",
+        "💰 NSF Funded Research",
     ])
 
     # ─── Tab 1: Search by field/keyword ──────────────────────────────────
     with tab_field:
-        st.subheader("Which universities grant doctoral degrees in this field?")
+        st.subheader("Universities with doctoral programs in this field")
 
         keyword = st.text_input(
-            "Enter a field name or keyword",
-            placeholder="e.g. chemistry, mechanical engineering, sociology",
+            "Field or keyword",
+            placeholder="e.g. chemistry, mechanical engineering",
             max_chars=MAX_QUERY_LENGTH,
         )
         keyword = sanitize_input(keyword)
@@ -489,11 +556,11 @@ def main():
 
     # ─── Tab 2: Search by institution ────────────────────────────────────
     with tab_institution:
-        st.subheader("What doctoral fields does this institution offer?")
+        st.subheader("Doctoral fields offered by this institution")
 
         inst_name = st.text_input(
-            "Enter an institution name",
-            placeholder="e.g. MIT, Stanford, Georgia Tech",
+            "Institution name",
+            placeholder="e.g. MIT, Stanford",
             max_chars=MAX_QUERY_LENGTH,
             key="inst_input",
         )
@@ -567,9 +634,8 @@ def main():
 
     # ─── Tab 3: NSF Funded Research Search ────────────────────────────────
     with tab_funded:
-        st.subheader("Search funded research awards")
-        st.caption("Data from the NSF Award Search API, pre-loaded into a local cache. "
-                   "Results are cross-referenced against the PhD verification database.")
+        st.subheader("Search NSF-funded research awards")
+        st.caption("From the NSF Award Search API, cross-referenced against verified PhD-granting institutions.")
 
         # Check if NSF cache exists
         if not NSF_CSV_PATH.exists():

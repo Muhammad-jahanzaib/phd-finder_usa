@@ -22,6 +22,7 @@ COPY . .
 # IPEDS_DB_PATH points at the pre-downloaded database inside the container.
 # Override via env var if you mount a different DB file.
 ENV IPEDS_DB_PATH=/app/data/scipeds.duckdb
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8501
 
