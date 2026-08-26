@@ -212,6 +212,7 @@ National Center for Education Statistics, or any government agency.
 **Last refreshed**: {last_refreshed}
 """
     )
+    st.caption("Built by Jahanzeb — [learnwithjahanzeb.com](https://learnwithjahanzeb.com)")
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────
