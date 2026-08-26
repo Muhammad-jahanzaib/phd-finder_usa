@@ -7,8 +7,11 @@ NSF-funded research awards. Deployable to Streamlit Community Cloud
 or any Docker-capable host.
 """
 
+import csv
 import io
+import os
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -22,8 +25,31 @@ from config import (
     MAX_QUERY_LENGTH, MAX_KEYWORDS, sanitize_input, get_metadata,
 )
 
+GA4_ID = "G-V1BCYS79RM"
+USAGE_LOG = DATA_DIR / "usage_log.csv"
+USAGE_LOG_FIELDS = ["timestamp", "tab", "query", "num_results"]
+
 
 # ── Database helpers ──────────────────────────────────────────────────────
+
+def _log_search(tab: str, query: str, num_results: int):
+    """Append an anonymous search record to usage_log.csv.
+
+    Logs only: timestamp, which tab, the query text, and result count.
+    No IP addresses, session IDs, or user agents are recorded.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    file_exists = USAGE_LOG.exists()
+    with open(USAGE_LOG, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=USAGE_LOG_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "tab": tab,
+            "query": query,
+            "num_results": num_results,
+        })
 
 @st.cache_resource
 def get_db():
@@ -213,6 +239,57 @@ National Center for Education Statistics, or any government agency.
 """
     )
     st.caption("Built by Jahanzeb — [learnwithjahanzeb.com](https://learnwithjahanzeb.com)")
+    st.caption("Anonymous search queries may be logged to help improve this tool.")
+
+
+def _render_admin_view():
+    """Read-only admin dashboard showing usage stats from usage_log.csv."""
+    st.markdown("---")
+    st.header("📊 Admin — Usage Insights")
+
+    if not USAGE_LOG.exists():
+        st.info("No usage data logged yet.")
+        return
+
+    df = pd.read_csv(USAGE_LOG)
+    if df.empty:
+        st.info("Usage log is empty.")
+        return
+
+    st.metric("Total searches logged", len(df))
+
+    # Searches by tab
+    st.subheader("Searches by tab")
+    tab_counts = df["tab"].value_counts()
+    st.bar_chart(tab_counts)
+
+    # Top field-search keywords
+    field_df = df[df["tab"] == "field"]
+    if not field_df.empty:
+        st.subheader("Top field-search keywords (top 20)")
+        kw_counts = field_df["query"].str.lower().value_counts().head(20)
+        st.dataframe(kw_counts.reset_index().rename(columns={"query": "keyword", "count": "searches"}))
+
+    # Top institution searches
+    inst_df = df[df["tab"] == "institution"]
+    if not inst_df.empty:
+        st.subheader("Top institution searches (top 20)")
+        inst_counts = inst_df["query"].str.lower().value_counts().head(20)
+        st.dataframe(inst_counts.reset_index().rename(columns={"query": "institution", "count": "searches"}))
+
+    # Dead-end searches (0 results)
+    zero_df = df[df["num_results"] == 0]
+    if not zero_df.empty:
+        st.subheader(f"Searches with 0 results ({len(zero_df)} total)")
+        zero_counts = zero_df.groupby(["tab", "query"]).size().reset_index(name="times")
+        zero_counts = zero_counts.sort_values("times", ascending=False).head(30)
+        st.dataframe(zero_counts)
+
+    # Day-by-day volume
+    st.subheader("Search volume by day")
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+    daily = df.groupby("date").size()
+    st.bar_chart(daily)
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────
@@ -222,6 +299,20 @@ def main():
         page_title="PhD Finder",
         page_icon="🎓",
         layout="wide",
+    )
+
+    # ── Google Analytics (GA4) ────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <script async src="https://www.googletagmanager.com/gtag/js?id={GA4_ID}"></script>
+        <script>
+          window.dataLayer = window.dataLayer || [];
+          function gtag(){{ dataLayer.push(arguments); }}
+          gtag('js', new Date());
+          gtag('config', '{GA4_ID}');
+        </script>
+        """,
+        unsafe_allow_html=True,
     )
 
     # ── Landing paragraph ─────────────────────────────────────────────────
@@ -315,6 +406,7 @@ def main():
 
                 if not results:
                     st.info(f"No doctoral completions found in {year_start}-{year_end} for these CIP codes")
+                    _log_search("field", keyword, 0)
                 else:
                     inst_data = {}
                     for unitid, cip, year, awards in results:
@@ -337,6 +429,8 @@ def main():
                         inst_data[unitid]["by_year"][year] += awards
 
                     sorted_insts = sorted(inst_data.items(), key=lambda x: -x[1]["total_phds"])
+
+                    _log_search("field", keyword, len(sorted_insts))
 
                     states = sorted(set(info["state"] for info in inst_data.values()))
                     selected_states = st.multiselect("Filter by state", states, default=[], key="field_states")
@@ -416,8 +510,11 @@ def main():
 
             if not matches:
                 st.warning(f"No institutions found matching '{inst_name}' at threshold {inst_threshold}")
+                _log_search("institution", inst_name, 0)
             else:
                 st.success(f"Found {len(matches)} matching institution(s)")
+
+                _log_search("institution", inst_name, len(matches))
 
                 for uid, real_name, state, score in matches[:10]:
                     with st.expander(f"{real_name} ({state}) — score: {score:.0f}", expanded=(len(matches) <= 3)):
@@ -542,6 +639,8 @@ def main():
                                f"({filtered['pi_name'].nunique()} PIs, "
                                f"{filtered['institution'].nunique()} institutions)")
 
+                    _log_search("nsf_funded", ", ".join(keywords), len(filtered))
+
             # Display results
             nsf_df = st.session_state.get("nsf_results")
             if nsf_df is not None and not nsf_df.empty:
@@ -646,6 +745,11 @@ def main():
 
     # ── Footer ────────────────────────────────────────────────────────────
     _render_footer()
+
+    # ── Admin view (hidden, accessible via ?admin=true) ───────────────────
+    params = st.query_params
+    if params.get("admin") == "true":
+        _render_admin_view()
 
 
 if __name__ == "__main__":

@@ -97,3 +97,37 @@ The NSF Award Search API provides information on NSF-funded research awards, com
 - **Abstract keyword false positives**: Keyword matching against `abstractText` can produce false positives when a keyword appears in an unrelated context within the abstract (e.g., "federated learning" mentioned in a broader AI infrastructure grant). Users should read the abstract snippet before treating any match as confirmed-relevant.
 - **US institutions only**: The NSF API covers US-based awardee institutions. International collaborators may appear as co-PIs but the award is tied to the US institution.
 - **Rate limits**: The API has soft rate limits. The module caches responses locally (7-day expiry) to minimize repeated calls. Bulk searches across many keywords will be slower due to polite 1-second delays between requests.
+
+---
+
+## Usage Logging & Analytics
+
+### Page-View Analytics
+Google Analytics 4 (GA4) is injected via a script tag in the Streamlit app's HTML head.
+Measurement ID: `G-V1BCYS79RM`.
+
+### Anonymous Search Logging
+Every search performed (field search, institution search, and NSF funded research search)
+is logged to `data/usage_log.csv` with the following fields only:
+- `timestamp` (ISO format, second precision)
+- `tab` (which search tab was used)
+- `query` (the search text)
+- `num_results` (number of results returned, 0 if none)
+
+**No IP addresses, session IDs, user agents, or other identifying information is recorded.**
+
+### Admin Insights
+A read-only admin dashboard is available at `?admin=true` (not linked in the public UI).
+It reads `usage_log.csv` and shows: total searches, top keywords, top institutions,
+zero-result searches, and daily volume.
+
+### Data Persistence Limitation
+The usage log (`data/usage_log.csv`) is stored inside the Docker container's filesystem.
+On platforms with ephemeral storage (e.g. Render free tier, Railway, Fly.io),
+**this log will be lost on every redeploy or restart**. To preserve data long-term,
+you would need to either:
+1. Mount a persistent disk at `/app/data/`
+2. Ship logs to an external service (e.g. a database, S3, or a logging API)
+3. Run the app on a server with a persistent filesystem
+
+This limitation is noted honestly rather than silently losing data.
