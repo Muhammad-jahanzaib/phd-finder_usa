@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.git/
+*.md
+universities.txt
+data/nsf_cache/
+data/cache/
+.cs_phd_check/
+*.egg-info/
+.env

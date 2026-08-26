@@ -1,0 +1,10 @@
+# PhD Finder — Python dependencies
+# Core (runtime)
+streamlit>=1.30.0
+duckdb>=0.10.0
+pandas>=2.0.0
+rapidfuzz>=3.0.0
+requests>=2.31.0
+
+# Build-time only: downloads the IPEDS database during docker build
+scipeds>=0.0.8
